@@ -142,6 +142,13 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
         batch_size: int = 32,
         max_concurrent_requests: int = 1,
         llamafile_server_kwargs: dict[str, Any] | None = None,
+        # Remote mode parameters
+        remote: bool = False,
+        base_url: str | None = None,
+        api_key: str = "not-needed",
+        timeout: int = 60,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
         **kwargs: Any,
     ):
         """Initialize the FlowJudge Llamafile model.
@@ -163,17 +170,25 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
         :param batch_size: Batch size for processing.
         :param max_concurrent_requests: Maximum number of concurrent requests.
         :param llamafile_server_kwargs: Additional keyword arguments for the Llamafile server.
+        :param remote: Whether to use remote mode (connect to external server) or local mode.
+        :param base_url: Base URL of the external Llamafile server (required if remote=True).
+        :param api_key: API key for authentication with the remote server.
+        :param timeout: Request timeout in seconds for remote mode.
+        :param max_retries: Maximum number of retry attempts for remote mode.
+        :param retry_delay: Delay between retry attempts for remote mode.
         :param kwargs: Additional keyword arguments.
 
         Note:
-        Continuous batching is enabled by default.
+        When remote=False (default): Runs Llamafile locally with continuous batching enabled.
+        When remote=True: Connects to an external Llamafile server at the specified base_url.
 
-        For more information about these arguments and their effects, please refer to the
+        For more information about local mode arguments and their effects, please refer to the
         Llamafile documentation:
         https://github.com/Mozilla-Ocho/llamafile/blob/main/llama.cpp/server/README.md
 
         :raises LlamafileError: If required Llamafile packages are not installed or
             initialization fails.
+        :raises ValueError: If remote=True but base_url is not provided.
         """
         if not LLAMAFILE_AVAILABLE:
             raise LlamafileError(
@@ -182,6 +197,10 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
                 "Please install them by adding 'llamafile' to your extras:\n"
                 "pip install flow-judge[llamafile]",
             )
+
+        # Validate remote mode parameters
+        if remote and base_url is None:
+            raise ValueError("base_url is required when remote=True")
 
         # Allow internal override of model_id for debugging/development
         model_id = kwargs.pop("_model_id", None) or self._DEFAULT_MODEL_ID
@@ -198,65 +217,93 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
 
         generation_params = GenerationParams(**(generation_params or {}))
 
-        if port is None:
-            port = self._get_next_port()
+        # Set remote mode flag
+        self.remote = remote
 
-        if thread_count is None:
-            thread_count = os.cpu_count()
+        if remote:
+            # Remote mode configuration
+            self.base_url = base_url
+            self.api_key = api_key
+            self.timeout = timeout
+            self.max_retries = max_retries
+            self.retry_delay = retry_delay
+            self.max_concurrent_requests = max_concurrent_requests
 
-        config = LlamafileConfig(
-            generation_params=generation_params,
-            model_filename="flow-judge.llamafile",
-            cache_dir=cache_dir,
-            port=port,
-            disable_kv_offload=disable_kv_offload,
-            quantized_kv=quantized_kv,
-            flash_attn=flash_attn,
-            context_size=context_size,
-            gpu_layers=gpu_layers,
-            thread_count=thread_count,
-            batch_size=batch_size,
-            max_concurrent_requests=max_concurrent_requests,
-            llamafile_server_kwargs=llamafile_server_kwargs,
-            **kwargs,
-        )
-        self.config = config
+            # Remote mode doesn't need local configuration
+            self.llamafile_process = None
+            self._server_running = True  # Assume remote server is running
+            self.config = None
+        else:
+            # Local mode configuration
+            if port is None:
+                port = self._get_next_port()
 
-        # Call both parent class initializers
-        BaseFlowJudgeModel.__init__(
-            self, model_id, self._MODEL_TYPE, config.generation_params, **kwargs
-        )
-        AsyncBaseFlowJudgeModel.__init__(
-            self, model_id, self._MODEL_TYPE, config.generation_params, **kwargs
-        )
+            if thread_count is None:
+                thread_count = os.cpu_count()
 
-        try:
-            self.generation_params = config.generation_params
+            config = LlamafileConfig(
+                generation_params=generation_params,
+                model_filename="flow-judge.llamafile",
+                cache_dir=cache_dir,
+                port=port,
+                disable_kv_offload=disable_kv_offload,
+                quantized_kv=quantized_kv,
+                flash_attn=flash_attn,
+                context_size=context_size,
+                gpu_layers=gpu_layers,
+                thread_count=thread_count,
+                batch_size=batch_size,
+                max_concurrent_requests=max_concurrent_requests,
+                llamafile_server_kwargs=llamafile_server_kwargs,
+                **kwargs,
+            )
+            self.config = config
+
+            # Local mode attributes
             self.cache_dir = config.cache_dir
             self.model_repo = config.model_id.split("/")[0]
             self.model_filename = config.model_filename
             self.port = config.port
             self.llamafile_process = None
-
-            self.sync_client = kwargs.get("sync_client") or OpenAI(
-                base_url=f"http://127.0.0.1:{self.port}/v1", api_key="not-needed"
-            )
-            self.async_client = kwargs.get("async_client") or AsyncOpenAI(
-                base_url=f"http://127.0.0.1:{self.port}/v1", api_key="not-needed"
-            )
-
-            self.timeout = kwargs.get("timeout", 30)
             self._server_running = False
-            self._context_depth = 0
 
             self.disable_kv_offload = config.disable_kv_offload
             self.quantized_kv = config.quantized_kv
             self.flash_attn = config.flash_attn
             self.llamafile_server_kwargs = config.llamafile_server_kwargs
 
+        # Call both parent class initializers
+        BaseFlowJudgeModel.__init__(
+            self, model_id, self._MODEL_TYPE, generation_params, **kwargs
+        )
+        AsyncBaseFlowJudgeModel.__init__(
+            self, model_id, self._MODEL_TYPE, generation_params, **kwargs
+        )
+
+        try:
+            self.generation_params = generation_params
+            self._context_depth = 0
+
+            # Set up OpenAI clients based on mode
+            if self.remote:
+                self.sync_client = kwargs.get("sync_client") or OpenAI(
+                    base_url=self.base_url, api_key=self.api_key
+                )
+                self.async_client = kwargs.get("async_client") or AsyncOpenAI(
+                    base_url=self.base_url, api_key=self.api_key
+                )
+            else:
+                self.sync_client = kwargs.get("sync_client") or OpenAI(
+                    base_url=f"http://127.0.0.1:{self.port}/v1", api_key="not-needed"
+                )
+                self.async_client = kwargs.get("async_client") or AsyncOpenAI(
+                    base_url=f"http://127.0.0.1:{self.port}/v1", api_key="not-needed"
+                )
+
             self.metadata = {
                 "model_id": model_id,
                 "model_type": "llamafile",
+                "remote_mode": self.remote,
             }
 
         except Exception as e:
@@ -349,7 +396,15 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
         :raises FileNotFoundError: If the Llamafile is not found.
         :raises PermissionError: If the Llamafile is not executable.
         :raises RuntimeError: If the server fails to start within the timeout period.
+        :raises LlamafileError: If called in remote mode.
         """
+        if self.remote:
+            raise LlamafileError(
+                status_code=4,
+                message="start_llamafile_server() cannot be called in remote mode. "
+                "The server should already be running externally."
+            )
+
         logging.info("Starting llamafile server...")
         llamafile_path = self.download_llamafile()
         logging.info(f"Llamafile path: {llamafile_path}")
@@ -476,13 +531,14 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
 
     def stop_llamafile_server(self):
         """Stop the Llamafile server if it's running."""
-        if self.llamafile_process:
+        if not self.remote and self.llamafile_process:
             cleanup_llamafile(weakref.ref(self.llamafile_process))
             self.llamafile_process = None
 
     def cleanup(self):
         """Clean up resources by stopping the Llamafile server."""
-        self.stop_llamafile_server()
+        if not self.remote:
+            self.stop_llamafile_server()
 
     def __del__(self):
         """Destructor to ensure cleanup when the object is garbage collected."""
@@ -531,7 +587,13 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
         self, prompts: list[str], use_tqdm: bool = True, **kwargs: Any
     ) -> list[str]:
         self._ensure_server_running()
-        max_concurrency = self.generation_params.get("max_concurrent_requests", 4)
+
+        # Use appropriate concurrency limit based on mode
+        if self.remote:
+            max_concurrency = self.max_concurrent_requests
+        else:
+            max_concurrency = self.generation_params.get("max_concurrent_requests", 4)
+
         semaphore = asyncio.Semaphore(max_concurrency)
 
         async def generate_with_semaphore(prompt):
@@ -541,25 +603,38 @@ class Llamafile(BaseFlowJudgeModel, AsyncBaseFlowJudgeModel):
         return await asyncio.gather(*[generate_with_semaphore(prompt) for prompt in prompts])
 
     def _ensure_server_running(self):
-        if not self._server_running:
-            self.start_llamafile_server()
-            start_time = time.time()
-            while not self.is_server_running():
-                if time.time() - start_time > self.timeout:
-                    raise TimeoutError("Server failed to start within the specified timeout.")
-                time.sleep(0.1)
-            self._server_running = True
+        if self.remote:
+            # In remote mode, verify connectivity to external server
+            if not self.is_server_running():
+                raise LlamafileError(
+                    status_code=3,
+                    message=f"Cannot connect to remote Llamafile server at {self.base_url}. "
+                    "Please ensure the server is running and accessible."
+                )
+        else:
+            # Local mode - start server if not running
+            if not self._server_running:
+                self.start_llamafile_server()
+                start_time = time.time()
+                timeout = getattr(self, 'timeout', 30)
+                while not self.is_server_running():
+                    if time.time() - start_time > timeout:
+                        raise TimeoutError("Server failed to start within the specified timeout.")
+                    time.sleep(0.1)
+                self._server_running = True
 
     def __enter__(self):
         """Context manager entry method."""
         self._context_depth += 1
-        self._ensure_server_running()
+        if not self.remote:
+            self._ensure_server_running()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit method."""
         self._context_depth -= 1
-        if self._context_depth == 0:
+        if self._context_depth == 0 and not self.remote:
+            # Only stop local servers when exiting context
             self.stop_llamafile_server()
             self._server_running = False
 
